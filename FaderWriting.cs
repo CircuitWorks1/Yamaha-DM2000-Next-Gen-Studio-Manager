@@ -1,0 +1,34 @@
+using System;
+using System.Drawing;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Windows.Forms;
+
+public static class FaderWriteProtocol {
+ // Yamaha kInputFader/kFader: set only the named channel, never a scene or cached bank.
+ public static byte[] Create(int channel,int raw,int device){if(channel<0||channel>95||raw<0||raw>1023||device<0||device>15)throw new ArgumentOutOfRangeException();return new byte[]{0xF0,0x43,(byte)(0x10|device),0x3E,0x7F,1,0x1C,0,(byte)channel,0,0,(byte)(raw>>7),(byte)(raw&127),0xF7};}
+ public static void Test(){for(int channel=0;channel<96;channel++)for(int raw=0;raw<1024;raw++){int c,v;byte[] p=Create(channel,raw,15);if(!FaderProtocol.TryRead(p,out c,out v)||c!=channel||v!=raw||p[2]!=0x1F)throw new Exception("Write encoding failed");}foreach(int[] input in new int[][]{new int[]{-1,0,0},new int[]{96,0,0},new int[]{0,-1,0},new int[]{0,1024,0},new int[]{0,0,-1},new int[]{0,0,16}}){bool rejected=false;try{Create(input[0],input[1],input[2]);}catch(ArgumentOutOfRangeException){rejected=true;}if(!rejected)throw new Exception("Invalid write accepted");}}
+ public static void HardwareTest(){string[] config=File.ReadAllLines(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"connection.ini"));uint input=0,output=0;foreach(var p in MidiInput.Devices())if(p.Value==config[0])input=p.Key;foreach(var p in FaderReader.Devices())if(p.Value==config[1])output=p.Key;using(var report=new StreamWriter(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"write-test.txt")))using(var connection=new FaderConnection(input,output,int.Parse(config[2]))){report.AutoFlush=true;int?[] values=new int?[96];DateTime[] dates=new DateTime[96];var clock=Stopwatch.StartNew();while(clock.ElapsedMilliseconds<2000){connection.Copy(values,dates);if(values[0].HasValue)break;Thread.Sleep(5);}if(!values[0].HasValue)throw new Exception("Cannot test without confirmed fader value");int original=values[0].Value;if(original==0){report.WriteLine("SKIPPED: channel 1 is at silence; no upward test performed.");return;}int target=original-1;report.WriteLine("Input 1 original: "+original+" / "+FaderProtocol.Label(original));bool restored=false;try{connection.WriteFader(0,target);clock.Restart();while(clock.ElapsedMilliseconds<2000){connection.Copy(values,dates);if(values[0]==target)break;Thread.Sleep(5);}if(values[0]!=target)throw new Exception("Desk did not confirm test write");report.WriteLine("Desk confirmed one-step decrease: "+target+" / "+FaderProtocol.Label(target));connection.Copy(values,dates);if(values[0]!=target)throw new Exception("Fader changed externally; not overwriting it with restoration");connection.WriteFader(0,original);clock.Restart();while(clock.ElapsedMilliseconds<2000){connection.Copy(values,dates);if(values[0]==original){restored=true;break;}Thread.Sleep(5);}if(!restored)throw new Exception("Restoration not confirmed");report.WriteLine("PASS: original channel 1 value restored and read back.");}finally{if(!restored){connection.Copy(values,dates);if(values[0]==target){connection.WriteFader(0,original);Thread.Sleep(200);report.WriteLine("Restoration requested after failure; verify on console.");}}}}}
+}
+
+sealed partial class ChannelStrip {
+ public void RefreshEdit(){if(!Dragging&&preview.HasValue&&(preview==Raw||(DateTime.UtcNow-previewTime).TotalSeconds>=1)){preview=null;Invalidate();}}
+ public static void TestGesture(){using(var strip=new ChannelStrip(96)){strip.Size=new Size(84,400);strip.Raw=500;int edits=0,last=-1;strip.FaderChanged+=delegate(int n,int raw){if(n!=96)throw new Exception("Gesture targeted wrong channel");edits++;last=raw;};Rectangle thumb=strip.Thumb;int y=thumb.Top+10;strip.OnMouseDown(new MouseEventArgs(MouseButtons.Left,1,thumb.Left+15,y,0));strip.OnMouseMove(new MouseEventArgs(MouseButtons.Left,0,thumb.Left+15,y-30,0));if(edits==0||last<=500||strip.Raw!=500)throw new Exception("Drag did not send an edit while preserving confirmed state");strip.OnMouseUp(new MouseEventArgs(MouseButtons.Left,1,0,y-30,0));if(strip.Dragging)throw new Exception("Drag capture not released");strip.Raw=last;strip.RefreshEdit();int before=edits;strip.OnMouseDown(new MouseEventArgs(MouseButtons.Left,1,8,15,0));strip.OnMouseMove(new MouseEventArgs(MouseButtons.Left,0,8,0,0));if(edits!=before)throw new Exception("Header selection wrote a fader");strip.OnKeyDown(new KeyEventArgs(Keys.Down));if(last!=(strip.Raw??0)-1)throw new Exception("Keyboard step incorrect");strip.RejectEdit();strip.Raw=0;before=edits;strip.OnKeyDown(new KeyEventArgs(Keys.Down));if(last<0)throw new Exception("Fader went below silence");strip.Raw=1023;strip.RejectEdit();strip.OnKeyDown(new KeyEventArgs(Keys.Up));if(last>1023)throw new Exception("Fader went above range");strip.RejectEdit();strip.Raw=null;before=edits;strip.OnMouseDown(new MouseEventArgs(MouseButtons.Left,1,20,80,0));strip.OnKeyDown(new KeyEventArgs(Keys.Up));if(edits!=before)throw new Exception("Offline fader allowed edits");}}
+ public event Action<int,int> FaderChanged;public bool Dragging{get;private set;}int startY,startRaw;double dragPosition;int? preview;DateTime previewTime;
+ int? DisplayRaw{get{return preview.HasValue&&(Dragging||(DateTime.UtcNow-previewTime).TotalSeconds<1)&&preview!=Raw?preview:Raw;}}
+ Rectangle Thumb{get{int h=Math.Max(60,Height-205);return new Rectangle((Width-18)/2-20,145+(int)((1-(DisplayRaw??0)/1023.0)*(h-23)),40,23);}}
+ void PressFader(MouseEventArgs e){Focus();if(e.Button!=MouseButtons.Left||!Raw.HasValue)return;var hit=Thumb;hit.Inflate(5,6);if(!hit.Contains(e.Location))return;Dragging=true;startY=e.Y;startRaw=DisplayRaw.Value;dragPosition=startRaw;Capture=true;}
+ protected override void OnMouseMove(MouseEventArgs e){base.OnMouseMove(e);if(!Dragging)return;double sensitivity=(ModifierKeys&Keys.Shift)!=0?0.2:1.0;dragPosition=Math.Max(0,Math.Min(1023,dragPosition+(startY-e.Y)*1023.0/Math.Max(1,Math.Max(60,Height-205)-23)*sensitivity));startY=e.Y;SendEdit((int)Math.Round(dragPosition));}
+ void SendEdit(int raw){if(preview==raw)return;preview=raw;previewTime=DateTime.UtcNow;Invalidate();if(FaderChanged!=null)FaderChanged(Number,raw);}
+ protected override void OnMouseUp(MouseEventArgs e){base.OnMouseUp(e);if(e.Button==MouseButtons.Left&&Dragging){Dragging=false;Capture=false;Invalidate();}}
+ protected override void OnMouseCaptureChanged(EventArgs e){base.OnMouseCaptureChanged(e);if(!Capture){Dragging=false;Invalidate();}}
+ protected override bool IsInputKey(Keys key){Keys k=key&Keys.KeyCode;return k==Keys.Up||k==Keys.Down||base.IsInputKey(key);}
+ protected override void OnKeyDown(KeyEventArgs e){base.OnKeyDown(e);if(!Raw.HasValue)return;if(e.KeyCode==Keys.Up||e.KeyCode==Keys.Down){int step=e.Shift?10:1;SendEdit(Math.Max(0,Math.Min(1023,(DisplayRaw??Raw.Value)+(e.KeyCode==Keys.Up?step:-step))));e.Handled=true;e.SuppressKeyPress=true;}}
+ public void RejectEdit(){preview=null;Dragging=false;Capture=false;Invalidate();}
+}
+
+
+
+
+
